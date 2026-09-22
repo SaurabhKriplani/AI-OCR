@@ -158,63 +158,74 @@ function App() {
   };
 
   // Optimize high-resolution phone camera photos before sending to prevent cloud memory limits
-  const optimizeImageForOCR = (imageFile) => {
+  // Uses synchronous toDataURL() instead of toBlob() to avoid browser hangs
+  const optimizeImageForOCR = async (imageFile) => {
+    if (!imageFile || !(imageFile instanceof Blob)) {
+      return imageFile;
+    }
+
     return new Promise((resolve) => {
-      if (!imageFile || !(imageFile instanceof Blob)) {
-        return resolve(imageFile);
-      }
-
       const img = new Image();
-      const reader = new FileReader();
+      const objectUrl = URL.createObjectURL(imageFile);
 
-      reader.onload = (e) => {
-        img.onload = () => {
-          const maxDim = 1200;
-          let width = img.width;
-          let height = img.height;
+      img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
 
-          // If image is already within maxDim and under 500KB, send directly
-          if (width <= maxDim && height <= maxDim && imageFile.size < 500 * 1024) {
-            return resolve(imageFile);
+        const maxDim = 1200;
+        let width = img.naturalWidth;
+        let height = img.naturalHeight;
+
+        // If image is already small enough, send it directly
+        if (width <= maxDim && height <= maxDim && imageFile.size < 500 * 1024) {
+          return resolve(imageFile);
+        }
+
+        // Calculate new dimensions preserving aspect ratio
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // Use synchronous toDataURL (never hangs, works in all browsers)
+        try {
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+
+          // Convert base64 data URL to Blob/File
+          const byteString = atob(dataUrl.split(",")[1]);
+          const ab = new ArrayBuffer(byteString.length);
+          const ia = new Uint8Array(ab);
+          for (let i = 0; i < byteString.length; i++) {
+            ia[i] = byteString.charCodeAt(i);
           }
-
-          if (width > maxDim || height > maxDim) {
-            if (width > height) {
-              height = Math.round((height * maxDim) / width);
-              width = maxDim;
-            } else {
-              width = Math.round((width * maxDim) / height);
-              height = maxDim;
-            }
-          }
-
-          const canvas = document.createElement("canvas");
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext("2d");
-          ctx.drawImage(img, 0, 0, width, height);
-
-          canvas.toBlob(
-            (blob) => {
-              if (blob) {
-                const optimizedFile = new File([blob], imageFile.name.replace(/\.[^/.]+$/, ".jpg"), {
-                  type: "image/jpeg",
-                  lastModified: Date.now()
-                });
-                resolve(optimizedFile);
-              } else {
-                resolve(imageFile);
-              }
-            },
-            "image/jpeg",
-            0.88
+          const blob = new Blob([ab], { type: "image/jpeg" });
+          const optimizedFile = new File(
+            [blob],
+            imageFile.name.replace(/\.[^/.]+$/, ".jpg"),
+            { type: "image/jpeg", lastModified: Date.now() }
           );
-        };
-        img.onerror = () => resolve(imageFile);
-        img.src = e.target.result;
+          resolve(optimizedFile);
+        } catch (canvasErr) {
+          // Canvas tainted or other error — fall back to original
+          console.warn("Canvas optimization failed, using original file:", canvasErr);
+          resolve(imageFile);
+        }
       };
-      reader.onerror = () => resolve(imageFile);
-      reader.readAsDataURL(imageFile);
+
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        resolve(imageFile);
+      };
+
+      img.src = objectUrl;
     });
   };
 
