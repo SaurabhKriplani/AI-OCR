@@ -105,8 +105,4 @@ app.post(
 );
 
 // Start server
-app.listen(PORT, () => {
-    console.log(
-        `Node backend running on http://localhost:${PORT}`
-    );
-});
+module.exports = app;
