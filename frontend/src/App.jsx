@@ -405,12 +405,32 @@ function App() {
           {/* Error Banner */}
           {error && (
             <div className="error-banner">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <span>{error}</span>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", flex: 1 }}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginTop: "2px", flexShrink: 0 }}>
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <span>{error}</span>
+              </div>
+              <button
+                type="button"
+                className="btn-retry"
+                onClick={handleExtractText}
+                style={{
+                  marginLeft: "auto",
+                  padding: "4px 10px",
+                  borderRadius: "6px",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  background: "rgba(255,255,255,0.15)",
+                  color: "#fff",
+                  border: "1px solid rgba(255,255,255,0.3)",
+                  whiteSpace: "nowrap"
+                }}
+              >
+                Retry
+              </button>
             </div>
           )}
         </section>
@@ -428,6 +448,9 @@ function App() {
               <div className="processing-title">Extracting Document Intelligence</div>
               <div className="processing-subtitle">
                 PaddleOCR is detecting spatial bounding boxes, followed by Qwen LLM normalization & structured schema extraction.
+              </div>
+              <div style={{ marginTop: "12px", fontSize: "12px", opacity: 0.75 }}>
+                ⏳ Note: If this is the first request after 15 minutes of inactivity, Render's free tier ML container takes ~45–60s to wake up.
               </div>
             </div>
           ) : !extractedData ? (

@@ -53,31 +53,39 @@ app.post(
             console.log("Filename:", req.file.originalname);
             console.log("Size:", req.file.size);
 
-            // Create form data for Python
-            const formData = new FormData();
+            const cleanMlUrl = ML_API_URL.replace(/\/+$/, "");
 
-            formData.append(
-                "file",
-                req.file.buffer,
-                {
+            console.log("\nSending image to Python:", `${cleanMlUrl}/extract-text`);
+
+            // Helper to post to Python with automatic retry on Render cold-starts
+            const sendToPython = async (retriesLeft = 2) => {
+                const formData = new FormData();
+                formData.append("file", req.file.buffer, {
                     filename: req.file.originalname,
                     contentType: req.file.mimetype
-                }
-            );
+                });
 
-            console.log("\nSending image to Python...");
+                try {
+                    return await axios.post(`${cleanMlUrl}/extract-text`, formData, {
+                        headers: {
+                            ...formData.getHeaders()
+                        },
+                        timeout: 120000
+                    });
+                } catch (err) {
+                    const status = err.response?.status;
+                    const isColdStart = status === 502 || status === 503 || err.code === "ECONNRESET" || err.code === "ETIMEDOUT";
 
-            // Send image to FastAPI on Render
-            const response = await axios.post(
-                `${ML_API_URL}/extract-text`,
-                formData,
-                {
-                    headers: {
-                        ...formData.getHeaders()
-                    },
-                    timeout: 120000
+                    if (isColdStart && retriesLeft > 0) {
+                        console.log(`\n[Python ML Service waking up (Status: ${status || err.code})]. Waiting 6s before retry (${retriesLeft} retries remaining)...`);
+                        await new Promise((resolve) => setTimeout(resolve, 6000));
+                        return await sendToPython(retriesLeft - 1);
+                    }
+                    throw err;
                 }
-            );
+            };
+
+            const response = await sendToPython();
 
             console.log("\n==============================");
             console.log("RESPONSE FROM PYTHON");
@@ -103,12 +111,20 @@ app.post(
                 error.message
             );
 
+            const status = error.response?.status;
+            let userErrorMessage =
+                error.response?.data?.error ||
+                error.message ||
+                "Failed to extract text";
+
+            if (status === 502 || status === 503 || error.code === "ECONNRESET" || error.code === "ETIMEDOUT") {
+                userErrorMessage =
+                    "The Python ML service on Render is waking up from sleep mode (Render free tier can take 60-90s on cold start). Please wait 30 seconds and try again.";
+            }
+
             res.status(500).json({
                 success: false,
-                error:
-                    error.response?.data?.error ||
-                    error.message ||
-                    "Failed to extract text"
+                error: userErrorMessage
             });
         }
     }

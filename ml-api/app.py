@@ -20,10 +20,17 @@ app.add_middleware(
 )
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {
         "message": "AI OCR API is running"
+    }
+
+
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+def health_check():
+    return {
+        "status": "healthy"
     }
 
 

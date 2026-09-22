@@ -44,28 +44,7 @@ from langchain_core.prompts import PromptTemplate
 
 
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-if not HF_TOKEN:
-    raise RuntimeError(
-        "HF_TOKEN not found. Please add HF_TOKEN to .env"
-    )
-
-
-print("Loading Qwen LLM...")
-
-llm = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen2.5-7B-Instruct",
-    task="text-generation",
-    max_new_tokens=1000,
-    temperature=0.0,
-    huggingfacehub_api_token=HF_TOKEN
-)
-
-chat_model = ChatHuggingFace(
-    llm=llm
-)
-
-print("Qwen LLM configured successfully!")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 # --------------------------------------------------
@@ -181,7 +160,26 @@ Return exactly this structure:
 """
 )
 
-chain = prompt | chat_model
+chain = None
+
+if HF_TOKEN:
+    try:
+        print("Initializing Qwen LLM via HuggingFace...")
+        llm = HuggingFaceEndpoint(
+            repo_id="Qwen/Qwen2.5-7B-Instruct",
+            task="text-generation",
+            max_new_tokens=1000,
+            temperature=0.0,
+            huggingfacehub_api_token=HF_TOKEN
+        )
+        chat_model = ChatHuggingFace(llm=llm)
+        chain = prompt | chat_model
+        print("Qwen LLM configured successfully!")
+    except Exception as e:
+        print(f"Warning: Could not initialize HuggingFace LLM ({e}). Heuristic extractor will be used as fallback.")
+        chain = None
+else:
+    print("Notice: No HF_TOKEN provided. Heuristic fallback will be used for structured extraction.")
 
 
 # --------------------------------------------------
@@ -245,60 +243,105 @@ def clean_text(text):
 
 
 # --------------------------------------------------
-# Call Qwen
+# Heuristic fallback extractor
+# --------------------------------------------------
+
+def heuristic_fallback_entities(text):
+    entities = {
+        "manufacturer": {"status": "MISSING", "value": None},
+        "address": {"status": "MISSING", "value": None},
+        "product_name": {"status": "MISSING", "value": None},
+        "net_quantity": {"status": "MISSING", "value": None, "unit": None},
+        "mrp": {"status": "MISSING", "value": None, "currency": None},
+        "manufacturing_date": {"status": "MISSING", "value": None},
+        "best_before": {"status": "MISSING", "value": None},
+        "customer_care": {"status": "MISSING", "value": None},
+        "country_of_origin": {"status": "MISSING", "value": None}
+    }
+
+    # Match MRP
+    mrp_match = re.search(r"(?:MRP|PRICE|RS\.?|INR)\s*[:.]?\s*(\d+(?:\.\d{1,2})?)", text, re.IGNORECASE)
+    if mrp_match:
+        entities["mrp"] = {"status": "PRESENT", "value": mrp_match.group(1), "currency": "INR"}
+
+    # Match Net Quantity
+    qty_match = re.search(r"(?:NET\s*(?:QTY|QUANTITY|WT|WEIGHT)?)\s*[:.]?\s*(\d+(?:\.\d+)?)\s*(g|kg|ml|l|gm|grams)?", text, re.IGNORECASE)
+    if qty_match:
+        entities["net_quantity"] = {
+            "status": "PRESENT",
+            "value": qty_match.group(1),
+            "unit": qty_match.group(2) if qty_match.group(2) else None
+        }
+
+    # Match Country of Origin
+    origin_match = re.search(r"(?:COUNTRY\s*OF\s*ORIGIN|MADE\s*IN)\s*[:.]?\s*([A-Za-z]+)", text, re.IGNORECASE)
+    if origin_match:
+        entities["country_of_origin"] = {"status": "PRESENT", "value": origin_match.group(1).title()}
+
+    # Match Mfg Date
+    mfd_match = re.search(r"(?:MFD|MFG|PKD|PACKED)\s*[:.]?\s*(\d{1,2}[/-]\d{2,4})", text, re.IGNORECASE)
+    if mfd_match:
+        entities["manufacturing_date"] = {"status": "PRESENT", "value": mfd_match.group(1)}
+
+    # Match Best Before
+    bb_match = re.search(r"(?:BEST\s*BEFORE|USE\s*BY|EXPIRY)\s*[:.]?\s*([^\n,]+)", text, re.IGNORECASE)
+    if bb_match:
+        entities["best_before"] = {"status": "PRESENT", "value": bb_match.group(1).strip()}
+
+    # Match Customer Care
+    care_match = re.search(r"(?:CUSTOMER\s*CARE|CONSUMER\s*CARE|HELPLINE|CALL)\s*[:.]?\s*([0-9\s-]{8,15})", text, re.IGNORECASE)
+    if care_match:
+        entities["customer_care"] = {"status": "PRESENT", "value": care_match.group(1).strip()}
+
+    return entities
+
+
+# --------------------------------------------------
+# Call LLM / Fallback
 # --------------------------------------------------
 
 def extract_structured_data(cleaned_text):
 
     print("\n==============================")
-    print("SENDING TEXT TO QWEN LLM")
+    print("SENDING TEXT TO LLM")
     print("==============================")
 
     print(cleaned_text)
 
-    response = chain.invoke({
-        "ocr_text": cleaned_text
-    })
+    # 1. Try LLM if configured
+    if chain is not None:
+        try:
+            response = chain.invoke({
+                "ocr_text": cleaned_text
+            })
 
-    # ChatHuggingFace returns AIMessage
-    response_text = response.content
+            # ChatHuggingFace returns AIMessage
+            response_text = response.content.strip()
 
-    print("\n==============================")
-    print("RAW QWEN RESPONSE")
-    print("==============================")
+            print("\n==============================")
+            print("RAW LLM RESPONSE")
+            print("==============================")
+            print(response_text)
 
-    print(response_text)
+            # Remove markdown code fences if model adds them
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            elif response_text.startswith("```"):
+                response_text = response_text[3:]
 
-    # Remove markdown code fences if model adds them
-    response_text = response_text.strip()
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
 
-    if response_text.startswith("```json"):
-        response_text = response_text[7:]
+            response_text = response_text.strip()
 
-    elif response_text.startswith("```"):
-        response_text = response_text[3:]
+            return json.loads(response_text)
 
-    if response_text.endswith("```"):
-        response_text = response_text[:-3]
+        except Exception as e:
+            print("\nLLM EXTRACTION ERROR (Falling back to heuristic extraction):", str(e))
 
-    response_text = response_text.strip()
-
-    # Convert JSON string -> Python dictionary
-    try:
-
-        structured_data = json.loads(response_text)
-
-    except json.JSONDecodeError as e:
-
-        print("\nQWEN JSON PARSING ERROR:")
-        print(e)
-
-        structured_data = {
-            "error": "Qwen returned invalid JSON",
-            "raw_response": response_text
-        }
-
-    return structured_data
+    # 2. Heuristic fallback when LLM is unavailable or fails
+    fallback_data = heuristic_fallback_entities(cleaned_text)
+    return fallback_data
 
 
 # --------------------------------------------------
