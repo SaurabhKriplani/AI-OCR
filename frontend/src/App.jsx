@@ -172,7 +172,7 @@ function App() {
       const formData = new FormData();
       formData.append("image", file);
 
-      const response = await fetch("http://localhost:5000/api/extract-text", {
+      const response = await fetch("https://ai-ocr-rqtv.onrender.com/api/extract-text", {
         method: "POST",
         body: formData
       });
