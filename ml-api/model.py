@@ -51,7 +51,7 @@ if not HF_TOKEN:
 print("Loading Qwen LLM...")
 
 llm = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen2.5-72B-Instruct",
+    repo_id="Qwen/Qwen2.5-7B-Instruct",
     task="text-generation",
     max_new_tokens=1000,
     temperature=0.0,
