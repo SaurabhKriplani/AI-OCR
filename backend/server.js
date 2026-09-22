@@ -53,15 +53,19 @@ const waitForPythonAlive = async (cleanMlUrl, timeoutMs = 120000) => {
 };
 
 // Send the actual image to Python /extract-text.
-// Retries up to maxRetries times if Render returns a 502/503 or non-JSON body,
-// which can happen for a few seconds after healthz first passes.
-const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, maxRetries = 3) => {
+// Retries for up to `timeLimitMs` on 502/503 or non-JSON body —
+// Render's nginx can take 30-60s after healthz before it routes cleanly.
+const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, timeLimitMs = 90000) => {
+    const start = Date.now();
+    let attempt = 0;
     let lastError = null;
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(`\n[Extract] Attempt ${attempt}/${maxRetries} — sending image to Python...`);
+    while (Date.now() - start < timeLimitMs) {
+        attempt++;
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        console.log(`\n[Extract] Attempt ${attempt} (${elapsed}s elapsed) — sending image to Python...`);
 
+        try {
             const formData = new FormData();
             formData.append("file", fileBuffer, {
                 filename: originalname,
@@ -77,35 +81,38 @@ const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, m
             const contentType = response.headers["content-type"] || "";
             const isJson = contentType.includes("application/json");
 
-            // 502 / 503 from Render nginx — service still stabilizing, retry
+            // 502 / 503 — Render proxy not ready yet, retry
             if (response.status === 502 || response.status === 503) {
-                console.log(`[Extract] Got HTTP ${response.status} (Render proxy not ready). Waiting 5s before retry...`);
-                lastError = new Error(`HTTP ${response.status} from ML service`);
+                const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
+                console.log(`[Extract] HTTP ${response.status} (proxy not ready). ${remaining}s remaining, retrying in 5s...`);
+                lastError = new Error(`The AI service is still warming up. Please wait and try again.`);
                 await sleep(5000);
                 continue;
             }
 
-            // Non-JSON body — Render returned an error page
+            // Non-JSON body — some other error page, retry
             if (!isJson) {
-                console.log(`[Extract] Got non-JSON response (status ${response.status}). Waiting 5s before retry...`);
-                lastError = new Error(`Non-JSON response from ML service (HTTP ${response.status})`);
+                const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
+                console.log(`[Extract] Non-JSON response (HTTP ${response.status}). ${remaining}s remaining, retrying in 5s...`);
+                lastError = new Error(`The AI service is still warming up. Please wait and try again.`);
                 await sleep(5000);
                 continue;
             }
 
-            // Successful JSON response (even if success:false from Python, that's valid)
-            console.log(`[Extract] Got valid JSON response on attempt ${attempt}`);
+            // Got a valid JSON response
+            console.log(`[Extract] ✅ Valid JSON response on attempt ${attempt}`);
             return response.data;
 
         } catch (err) {
-            console.log(`[Extract] Attempt ${attempt} threw: ${err.message}`);
+            const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
+            console.log(`[Extract] Attempt ${attempt} threw: ${err.message}. ${remaining}s remaining, retrying in 5s...`);
             lastError = err;
-            if (attempt < maxRetries) await sleep(5000);
+            if (Date.now() - start + 5000 < timeLimitMs) await sleep(5000);
         }
     }
 
-    // All retries exhausted
-    throw lastError || new Error("Failed to reach ML service after multiple attempts");
+    // Time limit exhausted
+    throw lastError || new Error("The AI service is still warming up. Please wait and try again.");
 };
 
 // Sanitize error — never forward raw HTML to the client
@@ -185,13 +192,13 @@ app.post(
             console.log("[Extract] Waiting 3s for Render nginx to stabilize...");
             await sleep(3000);
 
-            // Step 3: Send the real image — auto-retries on 502/non-JSON (up to 3x)
+            // Step 3: Send the real image — retries on 502/non-JSON for up to 90 seconds
             const data = await callExtractText(
                 cleanMlUrl,
                 req.file.buffer,
                 req.file.originalname,
                 req.file.mimetype,
-                3
+                90000
             );
 
             console.log("\n==============================");
