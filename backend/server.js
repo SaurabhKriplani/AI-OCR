@@ -17,11 +17,136 @@ const upload = multer({
     storage: multer.memoryStorage()
 });
 
+// -----------------------------------------------
+// Helpers
+// -----------------------------------------------
+
+const getCleanMlUrl = () => {
+    if (!ML_API_URL) return null;
+    return ML_API_URL.replace(/\/+$/, "");
+};
+
+// Sleep helper
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Poll Python health endpoint until it responds OK or timeout
+const waitForPythonAlive = async (cleanMlUrl, timeoutMs = 120000) => {
+    const start = Date.now();
+    let attempt = 0;
+
+    while (Date.now() - start < timeoutMs) {
+        attempt++;
+        try {
+            const resp = await axios.get(`${cleanMlUrl}/healthz`, { timeout: 8000 });
+            if (resp.status === 200) {
+                console.log(`[Warmup] Python ML alive after ${Math.round((Date.now() - start) / 1000)}s (attempt ${attempt})`);
+                return true;
+            }
+        } catch (_) {
+            // still booting, wait and retry
+        }
+        const wait = Math.min(5000 + attempt * 1000, 10000); // 6s, 7s, 8s... max 10s
+        console.log(`[Warmup] Python ML not ready yet (attempt ${attempt}). Waiting ${wait / 1000}s...`);
+        await sleep(wait);
+    }
+    return false;
+};
+
+// After healthz passes, Render's nginx may still return 502 for a few seconds.
+// This function verifies that the /extract-text endpoint is actually accepting
+// requests by doing a lightweight probe — sending a tiny 1x1 white pixel PNG.
+const waitForExtractReady = async (cleanMlUrl, timeoutMs = 30000) => {
+    // Minimal valid 1x1 white PNG (67 bytes)
+    const TINY_PNG = Buffer.from(
+        "89504e470d0a1a0a0000000d49484452000000010000000108020000009001" +
+        "2e00000000c4944415478016360f8ff000000020001e221bc330000000049454e44ae426082",
+        "hex"
+    );
+
+    const start = Date.now();
+    let attempt = 0;
+
+    while (Date.now() - start < timeoutMs) {
+        attempt++;
+        try {
+            const probe = new FormData();
+            probe.append("file", TINY_PNG, {
+                filename: "probe.png",
+                contentType: "image/png"
+            });
+
+            const resp = await axios.post(`${cleanMlUrl}/extract-text`, probe, {
+                headers: { ...probe.getHeaders() },
+                timeout: 10000,
+                validateStatus: () => true   // don't throw on any HTTP status
+            });
+
+            const contentType = resp.headers["content-type"] || "";
+
+            // If we get a JSON response (even a success:false), the service is ready
+            if (contentType.includes("application/json") || resp.status === 200) {
+                console.log(`[Probe] /extract-text ready after ${Math.round((Date.now() - start) / 1000)}s`);
+                return true;
+            }
+
+            // Still getting HTML (502/503 proxy error from Render nginx)
+            console.log(`[Probe] Got non-JSON response (status ${resp.status}), waiting...`);
+        } catch (err) {
+            console.log(`[Probe] /extract-text probe error: ${err.message}`);
+        }
+
+        await sleep(3000);
+    }
+
+    return false;
+};
+
+// Sanitize error — never forward raw HTML to the client
+const sanitizeError = (err) => {
+    const rawData = err.response?.data;
+
+    // If data is a string and looks like HTML, replace with a clean message
+    if (typeof rawData === "string" && rawData.trim().startsWith("<")) {
+        const status = err.response?.status;
+        if (status === 502 || status === 503) {
+            return "The AI service is still warming up. Please wait 15 seconds and try again.";
+        }
+        return `ML service returned an unexpected response (HTTP ${status || "unknown"}).`;
+    }
+
+    // If data is an object with an error field, use it
+    if (rawData?.error) return rawData.error;
+
+    // Fall back to axios message
+    return err.message || "Failed to extract text";
+};
+
+// -----------------------------------------------
+// Routes
+// -----------------------------------------------
+
 // Test route
 app.get("/", (req, res) => {
-    res.json({
-        message: "Node backend is running"
-    });
+    res.json({ message: "Node backend is running" });
+});
+
+// Warmup route — called by frontend before submitting image
+// Pings Python ML service and waits up to 120 seconds for it to boot
+app.get("/api/warmup", async (req, res) => {
+    const cleanMlUrl = getCleanMlUrl();
+
+    if (!cleanMlUrl) {
+        return res.status(500).json({ ready: false, error: "ML_API_URL not configured" });
+    }
+
+    console.log("\n[Warmup] Pinging Python ML service...");
+    const alive = await waitForPythonAlive(cleanMlUrl);
+
+    if (alive) {
+        return res.json({ ready: true });
+    } else {
+        return res.status(503).json({ ready: false, error: "ML service did not respond within timeout" });
+    }
 });
 
 // OCR route
@@ -32,19 +157,14 @@ app.post(
 
         try {
 
-            // Check image
             if (!req.file) {
-                return res.status(400).json({
-                    success: false,
-                    error: "No image uploaded"
-                });
+                return res.status(400).json({ success: false, error: "No image uploaded" });
             }
 
-            if (!ML_API_URL) {
-                return res.status(500).json({
-                    success: false,
-                    error: "ML_API_URL environment variable is not configured"
-                });
+            const cleanMlUrl = getCleanMlUrl();
+
+            if (!cleanMlUrl) {
+                return res.status(500).json({ success: false, error: "ML_API_URL environment variable is not configured" });
             }
 
             console.log("\n==============================");
@@ -52,52 +172,52 @@ app.post(
             console.log("==============================");
             console.log("Filename:", req.file.originalname);
             console.log("Size:", req.file.size);
-
-            const cleanMlUrl = ML_API_URL.replace(/\/+$/, "");
-
             console.log("\nSending image to Python:", `${cleanMlUrl}/extract-text`);
 
-            // Helper to post to Python with automatic retry on Render cold-starts
-            const sendToPython = async (retriesLeft = 2) => {
-                const formData = new FormData();
-                formData.append("file", req.file.buffer, {
-                    filename: req.file.originalname,
-                    contentType: req.file.mimetype
+            // Step 1: Wait for healthz to confirm Python app is booted
+            const pingOk = await waitForPythonAlive(cleanMlUrl, 120000);
+            if (!pingOk) {
+                return res.status(503).json({
+                    success: false,
+                    error: "The AI ML service took too long to wake up. Please try again."
                 });
+            }
 
-                try {
-                    return await axios.post(`${cleanMlUrl}/extract-text`, formData, {
-                        headers: {
-                            ...formData.getHeaders()
-                        },
-                        timeout: 120000
-                    });
-                } catch (err) {
-                    const status = err.response?.status;
-                    const isColdStart = status === 502 || status === 503 || err.code === "ECONNRESET" || err.code === "ETIMEDOUT";
+            // Step 2: Verify /extract-text endpoint is actually serving JSON
+            // (Render nginx can return 502 for a few seconds even after healthz passes)
+            console.log("\n[Probe] Verifying /extract-text is ready...");
+            const extractReady = await waitForExtractReady(cleanMlUrl, 30000);
+            if (!extractReady) {
+                return res.status(503).json({
+                    success: false,
+                    error: "The AI service is initializing. Please wait 15 seconds and try again."
+                });
+            }
 
-                    if (isColdStart && retriesLeft > 0) {
-                        console.log(`\n[Python ML Service waking up (Status: ${status || err.code})]. Waiting 6s before retry (${retriesLeft} retries remaining)...`);
-                        await new Promise((resolve) => setTimeout(resolve, 6000));
-                        return await sendToPython(retriesLeft - 1);
-                    }
-                    throw err;
-                }
-            };
+            // Step 3: Build FormData and call Python with the actual image
+            const formData = new FormData();
+            formData.append("file", req.file.buffer, {
+                filename: req.file.originalname,
+                contentType: req.file.mimetype
+            });
 
-            const response = await sendToPython();
+            const response = await axios.post(`${cleanMlUrl}/extract-text`, formData, {
+                headers: { ...formData.getHeaders() },
+                timeout: 120000
+            });
+
+            // Verify we got a real JSON response, not an HTML error page
+            const contentType = response.headers["content-type"] || "";
+            if (!contentType.includes("application/json")) {
+                throw new Error("ML service returned non-JSON response. Please try again in 15 seconds.");
+            }
 
             console.log("\n==============================");
             console.log("RESPONSE FROM PYTHON");
             console.log("==============================");
-
-            console.log(
-                JSON.stringify(response.data, null, 2)
-            );
-
+            console.log(JSON.stringify(response.data, null, 2));
             console.log("\nSending response to React...");
 
-            // Send Python response directly to React
             res.status(200).json(response.data);
 
         } catch (error) {
@@ -105,26 +225,13 @@ app.post(
             console.error("\n==============================");
             console.error("OCR ERROR");
             console.error("==============================");
+            console.error(error.response?.data || error.message);
 
-            console.error(
-                error.response?.data ||
-                error.message
-            );
-
-            const status = error.response?.status;
-            let userErrorMessage =
-                error.response?.data?.error ||
-                error.message ||
-                "Failed to extract text";
-
-            if (status === 502 || status === 503 || error.code === "ECONNRESET" || error.code === "ETIMEDOUT") {
-                userErrorMessage =
-                    "The Python ML service on Render is waking up from sleep mode (Render free tier can take 60-90s on cold start). Please wait 30 seconds and try again.";
-            }
+            const cleanError = sanitizeError(error);
 
             res.status(500).json({
                 success: false,
-                error: userErrorMessage
+                error: cleanError
             });
         }
     }

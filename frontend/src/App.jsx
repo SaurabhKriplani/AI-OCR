@@ -78,8 +78,11 @@ function App() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [toastMessage, setToastMessage] = useState("");
   const [theme, setTheme] = useState("dark"); // "dark" | "light"
+  const [retryCountdown, setRetryCountdown] = useState(0); // seconds until auto-retry
+  const [isWakingUp, setIsWakingUp] = useState(false); // true when ML service is cold-starting
 
   const fileInputRef = useRef(null);
+  const retryTimerRef = useRef(null);
 
   // Trigger temporary toast notification
   const showToast = (msg) => {
@@ -229,6 +232,43 @@ function App() {
     });
   };
 
+  // Detect if error message is a wakeup/cold-start type
+  const isWakeupError = (msg) => {
+    if (!msg) return false;
+    const lower = msg.toLowerCase();
+    return (
+      lower.includes("waking up") ||
+      lower.includes("warming up") ||
+      lower.includes("initializing") ||
+      lower.includes("wait 15") ||
+      lower.includes("try again") ||
+      lower.includes("cold start") ||
+      lower.includes("free tier")
+    );
+  };
+
+  // Start auto-retry countdown
+  const startAutoRetry = (delaySecs, retryFn) => {
+    setRetryCountdown(delaySecs);
+    setIsWakingUp(true);
+
+    // Clear any existing timer
+    if (retryTimerRef.current) clearInterval(retryTimerRef.current);
+
+    let remaining = delaySecs;
+    retryTimerRef.current = setInterval(() => {
+      remaining -= 1;
+      setRetryCountdown(remaining);
+      if (remaining <= 0) {
+        clearInterval(retryTimerRef.current);
+        retryTimerRef.current = null;
+        setIsWakingUp(false);
+        setError("");
+        retryFn();
+      }
+    }, 1000);
+  };
+
   // Extract Text API Call
   const handleExtractText = async () => {
     if (!file) {
@@ -236,8 +276,16 @@ function App() {
       return;
     }
 
+    // Cancel any pending auto-retry
+    if (retryTimerRef.current) {
+      clearInterval(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+
     setLoading(true);
     setError("");
+    setIsWakingUp(false);
+    setRetryCountdown(0);
     setExtractedData(null);
 
     try {
@@ -249,6 +297,12 @@ function App() {
         method: "POST",
         body: formData
       });
+
+      // Handle non-JSON response (shouldn't happen after backend fix, but be safe)
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("The AI service is still warming up on Render. Auto-retrying in 20 seconds...");
+      }
 
       const data = await response.json();
 
@@ -266,7 +320,13 @@ function App() {
       showToast("✓ Extraction completed successfully!");
     } catch (err) {
       console.error(err);
-      setError(err.message || "Failed to connect to OCR service. Ensure Node and Python servers are running.");
+      const msg = err.message || "Failed to connect to OCR service.";
+      setError(msg);
+
+      // Auto-retry if it's a wakeup / cold-start error
+      if (isWakeupError(msg)) {
+        startAutoRetry(20, handleExtractText);
+      }
     } finally {
       setLoading(false);
     }
@@ -477,14 +537,29 @@ function App() {
 
           {/* Error Banner */}
           {error && (
-            <div className="error-banner">
+            <div className={`error-banner ${isWakingUp ? "error-banner-wakeup" : ""}`}>
               <div style={{ display: "flex", alignItems: "flex-start", gap: "8px", flex: 1 }}>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginTop: "2px", flexShrink: 0 }}>
-                  <circle cx="12" cy="12" r="10" />
-                  <line x1="12" y1="8" x2="12" y2="12" />
-                  <line x1="12" y1="16" x2="12.01" y2="16" />
-                </svg>
-                <span>{error}</span>
+                {isWakingUp ? (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginTop: "2px", flexShrink: 0, animation: "spin 1.5s linear infinite" }}>
+                    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ marginTop: "2px", flexShrink: 0 }}>
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="8" x2="12" y2="12" />
+                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                  </svg>
+                )}
+                <div style={{ flex: 1 }}>
+                  {isWakingUp ? (
+                    <>
+                      <div>The Python ML service on Render is waking up from sleep mode (Render free tier can take 60–90s on cold start).</div>
+                      <div style={{ marginTop: "4px", fontWeight: 600 }}>Auto-retrying in {retryCountdown}s…</div>
+                    </>
+                  ) : (
+                    <span>{error}</span>
+                  )}
+                </div>
               </div>
               <button
                 type="button"
@@ -499,10 +574,11 @@ function App() {
                   background: "rgba(255,255,255,0.15)",
                   color: "#fff",
                   border: "1px solid rgba(255,255,255,0.3)",
-                  whiteSpace: "nowrap"
+                  whiteSpace: "nowrap",
+                  flexShrink: 0
                 }}
               >
-                Retry
+                {isWakingUp ? "Retry Now" : "Retry"}
               </button>
             </div>
           )}
