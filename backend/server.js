@@ -5,7 +5,9 @@ const FormData = require("form-data");
 const cors = require("cors");
 
 const app = express();
-const PORT = process.env.PORT || 5000;;
+
+const PORT = process.env.PORT || 5000;
+const ML_API_URL = process.env.ML_API_URL;
 
 // Enable CORS
 app.use(cors());
@@ -38,6 +40,13 @@ app.post(
                 });
             }
 
+            if (!ML_API_URL) {
+                return res.status(500).json({
+                    success: false,
+                    error: "ML_API_URL environment variable is not configured"
+                });
+            }
+
             console.log("\n==============================");
             console.log("IMAGE RECEIVED BY NODE");
             console.log("==============================");
@@ -58,14 +67,15 @@ app.post(
 
             console.log("\nSending image to Python...");
 
-            // Send image to FastAPI
+            // Send image to FastAPI on Render
             const response = await axios.post(
-                "http://127.0.0.1:8000/extract-text",
+                `${ML_API_URL}/extract-text`,
                 formData,
                 {
                     headers: {
                         ...formData.getHeaders()
-                    }
+                    },
+                    timeout: 120000
                 }
             );
 
@@ -105,4 +115,8 @@ app.post(
 );
 
 // Start server
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
 module.exports = app;
