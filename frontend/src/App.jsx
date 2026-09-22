@@ -157,6 +157,67 @@ function App() {
     showToast("Loaded sample commodity dataset");
   };
 
+  // Optimize high-resolution phone camera photos before sending to prevent cloud memory limits
+  const optimizeImageForOCR = (imageFile) => {
+    return new Promise((resolve) => {
+      if (!imageFile || !(imageFile instanceof Blob)) {
+        return resolve(imageFile);
+      }
+
+      const img = new Image();
+      const reader = new FileReader();
+
+      reader.onload = (e) => {
+        img.onload = () => {
+          const maxDim = 1200;
+          let width = img.width;
+          let height = img.height;
+
+          // If image is already within maxDim and under 500KB, send directly
+          if (width <= maxDim && height <= maxDim && imageFile.size < 500 * 1024) {
+            return resolve(imageFile);
+          }
+
+          if (width > maxDim || height > maxDim) {
+            if (width > height) {
+              height = Math.round((height * maxDim) / width);
+              width = maxDim;
+            } else {
+              width = Math.round((width * maxDim) / height);
+              height = maxDim;
+            }
+          }
+
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0, width, height);
+
+          canvas.toBlob(
+            (blob) => {
+              if (blob) {
+                const optimizedFile = new File([blob], imageFile.name.replace(/\.[^/.]+$/, ".jpg"), {
+                  type: "image/jpeg",
+                  lastModified: Date.now()
+                });
+                resolve(optimizedFile);
+              } else {
+                resolve(imageFile);
+              }
+            },
+            "image/jpeg",
+            0.88
+          );
+        };
+        img.onerror = () => resolve(imageFile);
+        img.src = e.target.result;
+      };
+      reader.onerror = () => resolve(imageFile);
+      reader.readAsDataURL(imageFile);
+    });
+  };
+
   // Extract Text API Call
   const handleExtractText = async () => {
     if (!file) {
@@ -169,8 +230,9 @@ function App() {
     setExtractedData(null);
 
     try {
+      const fileToUpload = await optimizeImageForOCR(file);
       const formData = new FormData();
-      formData.append("image", file);
+      formData.append("image", fileToUpload);
 
       const response = await fetch("https://ai-ocr-rqtv.onrender.com/api/extract-text", {
         method: "POST",

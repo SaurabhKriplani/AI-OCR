@@ -362,6 +362,15 @@ def extract_text(image_bytes):
         io.BytesIO(image_bytes)
     ).convert("RGB")
 
+    # Downscale high-resolution images to fit in Render free tier (512MB RAM) and prevent OOM kills
+    MAX_DIM = 1200
+    if max(image.size) > MAX_DIM:
+        scale = MAX_DIM / max(image.size)
+        new_w = int(image.size[0] * scale)
+        new_h = int(image.size[1] * scale)
+        print(f"Resizing high-res image from {image.size} to ({new_w}, {new_h}) to avoid memory crash...")
+        image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
     image_array = np.array(image)
 
     # ---------------------------------------------
