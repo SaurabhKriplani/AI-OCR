@@ -4,7 +4,5 @@ python-multipart
 python-dotenv
 paddleocr
 paddlepaddle
-langchain
-langchain-huggingface
-langchain-core
-huggingface-hub
+Pillow
+numpy

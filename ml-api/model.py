@@ -2,184 +2,150 @@ import os
 import io
 import re
 import json
+import urllib.request
+import urllib.error
 
 import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
 
 # --------------------------------------------------
-# Environment
+# Environment Flags (Disable slow network checks & heavy features)
 # --------------------------------------------------
 
 load_dotenv()
 
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["PADDLE_PDX_DISABLE_UPDATE_CHECK"] = "True"
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
 os.environ["FLAGS_enable_pir_api"] = "0"
 
 # --------------------------------------------------
-# PaddleOCR
+# PaddleOCR (Use lightweight PP-OCRv4 mobile model)
 # --------------------------------------------------
 
 from paddleocr import PaddleOCR
 
-print("Loading PaddleOCR...")
+print("[Model] Loading lightweight PP-OCRv4 models...")
 
 ocr = PaddleOCR(
     lang="en",
+    ocr_version="PP-OCRv4",
     enable_mkldnn=False,
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
-    use_textline_orientation=False
+    use_textline_orientation=False,
+    show_log=False
 )
 
-print("PaddleOCR loaded successfully!")
+print("[Model] PaddleOCR loaded successfully!")
 
 
 # --------------------------------------------------
-# Qwen LLM
+# API Keys
 # --------------------------------------------------
-
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
-from langchain_core.prompts import PromptTemplate
-
 
 HF_TOKEN = os.getenv("HF_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 
 # --------------------------------------------------
-# LLM Prompt
+# LLM Prompt Template
 # --------------------------------------------------
 
-prompt = PromptTemplate(
-    input_variables=["ocr_text"],
-    template="""
-You are an OCR post-processing and structured information
-extraction system for packaged commodity labels in India.
+SYSTEM_PROMPT = """You are an OCR post-processing and structured information extraction system for packaged commodity labels in India.
 
-The following text was extracted from an image using OCR.
+Return ONLY a single valid JSON object with no markdown fences, matching exactly this schema:
+{
+    "manufacturer": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "address": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "product_name": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "net_quantity": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null, "unit": null},
+    "mrp": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null, "currency": null},
+    "manufacturing_date": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "best_before": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "customer_care": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null},
+    "country_of_origin": {"status": "PRESENT | MISSING | VALUE_MISSING", "value": null}
+}
 
-OCR TEXT:
---------------------
-{ocr_text}
---------------------
+Rules:
+1. Normalize currency to INR.
+2. Do not invent missing data.
+3. Use PRESENT, MISSING, or VALUE_MISSING for status."""
 
-Your task is ONLY to normalize the OCR text and extract
-structured product information.
 
-IMPORTANT RULES:
+# --------------------------------------------------
+# Lightweight HTTP LLM Invocation (Zero extra RAM)
+# --------------------------------------------------
 
-1. Correct obvious OCR errors only when the intended text
-   is clear.
+def query_llm_api(ocr_text):
+    # 1. Try Groq if key exists (Fastest & most reliable)
+    if GROQ_API_KEY:
+        try:
+            print("[LLM] Querying Groq API...")
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            payload = json.dumps({
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"OCR TEXT:\n{ocr_text}"}
+                ],
+                "temperature": 0.0,
+                "response_format": {"type": "json_object"}
+            }).encode("utf-8")
 
-2. Merge fragmented words when the intended word is clear.
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
 
-3. DO NOT invent or guess missing information.
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+                return json.loads(content)
+        except Exception as e:
+            print(f"[LLM] Groq API call failed: {e}")
 
-4. Preserve numerical values unless there is an obvious
-   OCR error.
+    # 2. Try Hugging Face Serverless API if HF_TOKEN exists
+    if HF_TOKEN:
+        try:
+            print("[LLM] Querying Hugging Face API...")
+            url = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct/v1/chat/completions"
+            payload = json.dumps({
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"OCR TEXT:\n{ocr_text}"}
+                ],
+                "max_tokens": 1000,
+                "temperature": 0.0
+            }).encode("utf-8")
 
-5. Preserve currency information.
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
 
-6. Normalize:
-   - Rs
-   - Rs.
-   - INR
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+                # Clean potential markdown
+                content = re.sub(r"^```json\s*", "", content.strip())
+                content = re.sub(r"\s*```$", "", content)
+                return json.loads(content)
+        except Exception as e:
+            print(f"[LLM] HuggingFace API call failed: {e}")
 
-   to:
-
-   INR
-
-7. Normalize units where possible.
-
-8. Distinguish between:
-
-   PRESENT:
-   The declaration exists and a value was found.
-
-   VALUE_MISSING:
-   The declaration exists but its value could not be found.
-
-   MISSING:
-   The declaration itself is not present.
-
-9. If information is uncertain, use null.
-
-10. Return ONLY valid JSON.
-
-Return exactly this structure:
-
-{{
-    "manufacturer": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "address": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "product_name": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "net_quantity": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null,
-        "unit": null
-    }},
-
-    "mrp": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null,
-        "currency": null
-    }},
-
-    "manufacturing_date": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "best_before": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "customer_care": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }},
-
-    "country_of_origin": {{
-        "status": "PRESENT | MISSING | VALUE_MISSING",
-        "value": null
-    }}
-}}
-"""
-)
-
-chain = None
-
-if HF_TOKEN:
-    try:
-        print("Initializing Qwen LLM via HuggingFace...")
-        llm = HuggingFaceEndpoint(
-            repo_id="Qwen/Qwen2.5-7B-Instruct",
-            task="text-generation",
-            max_new_tokens=1000,
-            temperature=0.0,
-            huggingfacehub_api_token=HF_TOKEN
-        )
-        chat_model = ChatHuggingFace(llm=llm)
-        chain = prompt | chat_model
-        print("Qwen LLM configured successfully!")
-    except Exception as e:
-        print(f"Warning: Could not initialize HuggingFace LLM ({e}). Heuristic extractor will be used as fallback.")
-        chain = None
-else:
-    print("Notice: No HF_TOKEN provided. Heuristic fallback will be used for structured extraction.")
+    return None
 
 
 # --------------------------------------------------
@@ -187,58 +153,26 @@ else:
 # --------------------------------------------------
 
 def group_into_lines(ocr_data, y_threshold=15):
-
     lines = []
-
     for item in ocr_data:
-
-        text = item["text"]
-        x = item["x"]
         y = item["y"]
-
         placed = False
-
         for line in lines:
-
             if abs(line["y"] - y) <= y_threshold:
-
                 line["words"].append(item)
-
-                line["words"].sort(
-                    key=lambda w: w["x"]
-                )
-
+                line["words"].sort(key=lambda w: w["x"])
                 placed = True
                 break
-
         if not placed:
-
-            lines.append({
-                "y": y,
-                "words": [item]
-            })
+            lines.append({"y": y, "words": [item]})
 
     lines.sort(key=lambda line: line["y"])
-
-    return [
-        " ".join(word["text"] for word in line["words"])
-        for line in lines
-    ]
+    return [" ".join(word["text"] for word in line["words"]) for line in lines]
 
 
 def clean_text(text):
-
-    # Normalize spaces
     text = re.sub(r"\s+", " ", text)
-
-    # Currency normalization
-    text = re.sub(
-        r"\bRs\.?\b",
-        "INR",
-        text,
-        flags=re.IGNORECASE
-    )
-
+    text = re.sub(r"\bRs\.?\b", "INR", text, flags=re.IGNORECASE)
     return text.strip()
 
 
@@ -297,51 +231,18 @@ def heuristic_fallback_entities(text):
 
 
 # --------------------------------------------------
-# Call LLM / Fallback
+# Structured extraction router
 # --------------------------------------------------
 
 def extract_structured_data(cleaned_text):
+    print("\n[Extraction] Attempting LLM extraction...")
+    llm_result = query_llm_api(cleaned_text)
+    if llm_result and isinstance(llm_result, dict):
+        print("[Extraction] ✅ Successfully extracted structured data via LLM")
+        return llm_result
 
-    print("\n==============================")
-    print("SENDING TEXT TO LLM")
-    print("==============================")
-
-    print(cleaned_text)
-
-    # 1. Try LLM if configured
-    if chain is not None:
-        try:
-            response = chain.invoke({
-                "ocr_text": cleaned_text
-            })
-
-            # ChatHuggingFace returns AIMessage
-            response_text = response.content.strip()
-
-            print("\n==============================")
-            print("RAW LLM RESPONSE")
-            print("==============================")
-            print(response_text)
-
-            # Remove markdown code fences if model adds them
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            elif response_text.startswith("```"):
-                response_text = response_text[3:]
-
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-
-            response_text = response_text.strip()
-
-            return json.loads(response_text)
-
-        except Exception as e:
-            print("\nLLM EXTRACTION ERROR (Falling back to heuristic extraction):", str(e))
-
-    # 2. Heuristic fallback when LLM is unavailable or fails
-    fallback_data = heuristic_fallback_entities(cleaned_text)
-    return fallback_data
+    print("[Extraction] Using heuristic fallback entity extractor...")
+    return heuristic_fallback_entities(cleaned_text)
 
 
 # --------------------------------------------------
@@ -349,51 +250,34 @@ def extract_structured_data(cleaned_text):
 # --------------------------------------------------
 
 def extract_text(image_bytes):
-
     print("\n================================")
     print("STARTING AI OCR PIPELINE")
     print("================================")
 
-    # ---------------------------------------------
     # 1. Convert image
-    # ---------------------------------------------
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    image = Image.open(
-        io.BytesIO(image_bytes)
-    ).convert("RGB")
-
-    # Downscale high-resolution images to fit in Render free tier (512MB RAM) and prevent OOM kills
+    # Downscale high-resolution images to fit in Render free tier (512MB RAM)
     MAX_DIM = 1200
     if max(image.size) > MAX_DIM:
         scale = MAX_DIM / max(image.size)
         new_w = int(image.size[0] * scale)
         new_h = int(image.size[1] * scale)
-        print(f"Resizing high-res image from {image.size} to ({new_w}, {new_h}) to avoid memory crash...")
+        print(f"Resizing high-res image from {image.size} to ({new_w}, {new_h})...")
         image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
     image_array = np.array(image)
 
-    # ---------------------------------------------
     # 2. PaddleOCR
-    # ---------------------------------------------
-
     print("\nRunning PaddleOCR...")
-
-    result = ocr.predict(image_array)
+    result = ocr.ocr(image_array, cls=False)
 
     ocr_data = []
-
-    for res in result:
-
-        texts = res["rec_texts"]
-        scores = res["rec_scores"]
-        polys = res["rec_polys"]
-
-        for text, score, poly in zip(
-            texts,
-            scores,
-            polys
-        ):
+    if result and len(result) > 0 and result[0] is not None:
+        for line in result[0]:
+            poly = np.array(line[0])
+            text = line[1][0]
+            score = line[1][1]
 
             if float(score) < 0.3:
                 continue
@@ -401,67 +285,20 @@ def extract_text(image_bytes):
             x = int(np.min(poly[:, 0]))
             y = int(np.min(poly[:, 1]))
 
-            ocr_data.append({
-                "text": text,
-                "score": float(score),
-                "x": x,
-                "y": y
-            })
+            ocr_data.append({"text": text, "score": float(score), "x": x, "y": y})
 
-    print(
-        f"OCR detected {len(ocr_data)} text segments"
-    )
+    print(f"OCR detected {len(ocr_data)} text segments")
 
-    # ---------------------------------------------
     # 3. Arrange OCR into lines
-    # ---------------------------------------------
-
-    lines = group_into_lines(
-        ocr_data
-    )
-
+    lines = group_into_lines(ocr_data)
     raw_text = "\n".join(lines)
 
-    print("\n==============================")
-    print("RAW OCR TEXT")
-    print("==============================")
-
-    print(raw_text)
-
-    # ---------------------------------------------
     # 4. Clean OCR text
-    # ---------------------------------------------
+    cleaned_lines = [clean_text(line) for line in lines if clean_text(line)]
+    cleaned_text = "\n".join(cleaned_lines)
 
-    cleaned_lines = []
-
-    for line in lines:
-
-        cleaned_line = clean_text(line)
-
-        if cleaned_line:
-            cleaned_lines.append(cleaned_line)
-
-    cleaned_text = "\n".join(
-        cleaned_lines
-    )
-
-    print("\n==============================")
-    print("CLEANED OCR TEXT")
-    print("==============================")
-
-    print(cleaned_text)
-
-    # ---------------------------------------------
-    # 5. Qwen LLM
-    # ---------------------------------------------
-
-    structured_data = extract_structured_data(
-        cleaned_text
-    )
-
-    # ---------------------------------------------
-    # 6. Return everything
-    # ---------------------------------------------
+    # 5. LLM or Heuristic Extraction
+    structured_data = extract_structured_data(cleaned_text)
 
     return {
         "raw_text": raw_text,
