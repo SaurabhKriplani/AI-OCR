@@ -26,36 +26,65 @@ const getCleanMlUrl = () => {
     return ML_API_URL.replace(/\/+$/, "");
 };
 
-// Sleep helper
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Poll Python /healthz until it responds 200 or timeout
-const waitForPythonAlive = async (cleanMlUrl, timeoutMs = 120000) => {
+// Step 1: Poll /healthz until the process is alive (app started, but models may still be loading)
+const waitForProcessAlive = async (cleanMlUrl, timeoutMs = 60000) => {
     const start = Date.now();
     let attempt = 0;
 
     while (Date.now() - start < timeoutMs) {
         attempt++;
         try {
-            const resp = await axios.get(`${cleanMlUrl}/healthz`, { timeout: 8000 });
+            const resp = await axios.get(`${cleanMlUrl}/healthz`, { timeout: 6000 });
             if (resp.status === 200) {
-                console.log(`[Warmup] Python ML alive after ${Math.round((Date.now() - start) / 1000)}s (attempt ${attempt})`);
+                console.log(`[Boot] Python process alive after ${Math.round((Date.now() - start) / 1000)}s (attempt ${attempt})`);
                 return true;
             }
         } catch (_) {
-            // still booting
+            // process not up yet
         }
-        const wait = Math.min(5000 + attempt * 1000, 10000);
-        console.log(`[Warmup] Python ML not ready yet (attempt ${attempt}). Waiting ${wait / 1000}s...`);
+        const wait = Math.min(4000 + attempt * 1000, 8000);
+        console.log(`[Boot] Process not up yet (attempt ${attempt}). Waiting ${wait / 1000}s...`);
         await sleep(wait);
     }
     return false;
 };
 
-// Send the actual image to Python /extract-text.
-// Retries for up to `timeLimitMs` on 502/503 or non-JSON body —
-// Render's nginx can take 30-60s after healthz before it routes cleanly.
-const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, timeLimitMs = 90000) => {
+// Step 2: Poll /ready until PaddleOCR models are fully loaded
+// This is separate from /healthz — the process is alive but models take 2-4 min to download.
+const waitForModelsReady = async (cleanMlUrl, timeoutMs = 300000) => {
+    const start = Date.now();
+    let attempt = 0;
+
+    while (Date.now() - start < timeoutMs) {
+        attempt++;
+        try {
+            const resp = await axios.get(`${cleanMlUrl}/ready`, {
+                timeout: 6000,
+                validateStatus: () => true
+            });
+            if (resp.status === 200) {
+                console.log(`[Models] Ready after ${Math.round((Date.now() - start) / 1000)}s (attempt ${attempt})`);
+                return true;
+            }
+            // 503 = still loading (expected), 500 = model load failed
+            if (resp.status === 500) {
+                console.error("[Models] Model load failed on Python side:", resp.data?.detail);
+                return false;
+            }
+        } catch (_) {
+            // /ready endpoint not responding yet
+        }
+        const elapsed = Math.round((Date.now() - start) / 1000);
+        console.log(`[Models] Still loading (attempt ${attempt}, ${elapsed}s elapsed)...`);
+        await sleep(8000);
+    }
+    return false;
+};
+
+// Step 3: Send actual image — retries on 502/503/non-JSON for up to 60s
+const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, timeLimitMs = 60000) => {
     const start = Date.now();
     let attempt = 0;
     let lastError = null;
@@ -75,61 +104,74 @@ const callExtractText = async (cleanMlUrl, fileBuffer, originalname, mimetype, t
             const response = await axios.post(`${cleanMlUrl}/extract-text`, formData, {
                 headers: { ...formData.getHeaders() },
                 timeout: 120000,
-                validateStatus: () => true   // handle all status codes manually
+                validateStatus: () => true
             });
 
             const contentType = response.headers["content-type"] || "";
             const isJson = contentType.includes("application/json");
 
-            // 502 / 503 — Render proxy not ready yet, retry
             if (response.status === 502 || response.status === 503) {
                 const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
-                console.log(`[Extract] HTTP ${response.status} (proxy not ready). ${remaining}s remaining, retrying in 5s...`);
-                lastError = new Error(`The AI service is still warming up. Please wait and try again.`);
+                console.log(`[Extract] HTTP ${response.status}. ${remaining}s remaining, retrying in 5s...`);
+                lastError = new Error("The AI service is still warming up. Please wait and try again.");
                 await sleep(5000);
                 continue;
             }
 
-            // Non-JSON body — some other error page, retry
             if (!isJson) {
                 const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
-                console.log(`[Extract] Non-JSON response (HTTP ${response.status}). ${remaining}s remaining, retrying in 5s...`);
-                lastError = new Error(`The AI service is still warming up. Please wait and try again.`);
+                console.log(`[Extract] Non-JSON (HTTP ${response.status}). ${remaining}s remaining, retrying in 5s...`);
+                lastError = new Error("The AI service is still warming up. Please wait and try again.");
                 await sleep(5000);
                 continue;
             }
 
-            // Got a valid JSON response
             console.log(`[Extract] ✅ Valid JSON response on attempt ${attempt}`);
             return response.data;
 
         } catch (err) {
             const remaining = Math.round((timeLimitMs - (Date.now() - start)) / 1000);
-            console.log(`[Extract] Attempt ${attempt} threw: ${err.message}. ${remaining}s remaining, retrying in 5s...`);
+            console.log(`[Extract] Attempt ${attempt} error: ${err.message}. ${remaining}s remaining...`);
             lastError = err;
             if (Date.now() - start + 5000 < timeLimitMs) await sleep(5000);
         }
     }
 
-    // Time limit exhausted
     throw lastError || new Error("The AI service is still warming up. Please wait and try again.");
 };
 
 // Sanitize error — never forward raw HTML to the client
 const sanitizeError = (err) => {
     const rawData = err.response?.data;
-
-    // If data is a string that looks like HTML, return a clean message
     if (typeof rawData === "string" && rawData.trim().startsWith("<")) {
         const status = err.response?.status;
         if (status === 502 || status === 503) {
-            return "The AI service is still warming up. Please wait 15 seconds and try again.";
+            return "The AI service is still warming up. Please wait and try again.";
         }
         return `ML service returned an unexpected response (HTTP ${status || "unknown"}).`;
     }
-
     if (rawData?.error) return rawData.error;
     return err.message || "Failed to extract text";
+};
+
+// -----------------------------------------------
+// Keep-alive ping — runs every 14 minutes in the
+// background to prevent Render from sleeping Python.
+// -----------------------------------------------
+const startKeepAlive = () => {
+    const cleanMlUrl = getCleanMlUrl();
+    if (!cleanMlUrl) return;
+
+    setInterval(async () => {
+        try {
+            const resp = await axios.get(`${cleanMlUrl}/healthz`, { timeout: 8000 });
+            console.log(`[Keep-alive] Pinged Python ML (status ${resp.status})`);
+        } catch (err) {
+            console.log(`[Keep-alive] Ping failed: ${err.message}`);
+        }
+    }, 14 * 60 * 1000); // every 14 minutes
+
+    console.log("[Keep-alive] Scheduled Python ML ping every 14 minutes");
 };
 
 // -----------------------------------------------
@@ -147,14 +189,21 @@ app.get("/api/warmup", async (req, res) => {
         return res.status(500).json({ ready: false, error: "ML_API_URL not configured" });
     }
 
-    console.log("\n[Warmup] Pinging Python ML service...");
-    const alive = await waitForPythonAlive(cleanMlUrl);
+    console.log("\n[Warmup] Checking Python ML service...");
 
-    if (alive) {
-        return res.json({ ready: true });
-    } else {
-        return res.status(503).json({ ready: false, error: "ML service did not respond within timeout" });
+    // Step 1: Is the process alive?
+    const alive = await waitForProcessAlive(cleanMlUrl, 60000);
+    if (!alive) {
+        return res.status(503).json({ ready: false, error: "ML service process did not start within timeout" });
     }
+
+    // Step 2: Are models loaded?
+    const ready = await waitForModelsReady(cleanMlUrl, 300000);
+    if (!ready) {
+        return res.status(503).json({ ready: false, error: "ML models did not finish loading within timeout" });
+    }
+
+    return res.json({ ready: true });
 });
 
 // OCR route
@@ -178,34 +227,39 @@ app.post(
             console.log("Filename:", req.file.originalname);
             console.log("Size:", req.file.size);
 
-            // Step 1: Wait for Python app to boot (healthz polling)
-            const pingOk = await waitForPythonAlive(cleanMlUrl, 120000);
-            if (!pingOk) {
+            // Step 1: Wait for Python process to boot (fast — seconds)
+            console.log("\n[Boot] Waiting for Python process...");
+            const alive = await waitForProcessAlive(cleanMlUrl, 60000);
+            if (!alive) {
                 return res.status(503).json({
                     success: false,
-                    error: "The AI ML service took too long to wake up. Please try again."
+                    error: "The AI service process did not start. Please try again."
                 });
             }
 
-            // Step 2: Give Render nginx a moment to sync after boot
-            // (healthz can pass 2-3 seconds before nginx routes app traffic cleanly)
-            console.log("[Extract] Waiting 3s for Render nginx to stabilize...");
-            await sleep(3000);
+            // Step 2: Wait for models to finish loading (slow — 2-4 minutes on cold start)
+            console.log("\n[Models] Waiting for PaddleOCR models to load...");
+            const ready = await waitForModelsReady(cleanMlUrl, 300000);
+            if (!ready) {
+                return res.status(503).json({
+                    success: false,
+                    error: "The AI models took too long to load. Please try again."
+                });
+            }
 
-            // Step 3: Send the real image — retries on 502/non-JSON for up to 90 seconds
+            // Step 3: Send image — brief retry window in case nginx is still syncing
             const data = await callExtractText(
                 cleanMlUrl,
                 req.file.buffer,
                 req.file.originalname,
                 req.file.mimetype,
-                90000
+                60000
             );
 
             console.log("\n==============================");
             console.log("RESPONSE FROM PYTHON");
             console.log("==============================");
             console.log(JSON.stringify(data, null, 2));
-            console.log("\nSending response to React...");
 
             res.status(200).json(data);
 
@@ -216,11 +270,7 @@ app.post(
             console.error(error.response?.data || error.message);
 
             const cleanError = sanitizeError(error);
-
-            res.status(500).json({
-                success: false,
-                error: cleanError
-            });
+            res.status(500).json({ success: false, error: cleanError });
         }
     }
 );
@@ -228,6 +278,8 @@ app.post(
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on port ${PORT}`);
+    // Start keep-alive after 30s (give Python time to boot first)
+    setTimeout(startKeepAlive, 30000);
 });
 
 module.exports = app;
