@@ -37,6 +37,15 @@ ocr = PaddleOCR(
 
 print("[Model] PaddleOCR loaded successfully!")
 
+# Perform instant 10x10 dummy warm-up to pre-compile kernels and allocate memory
+try:
+    print("[Model] Running initial warm-up inference...")
+    dummy_img = np.zeros((10, 10, 3), dtype=np.uint8)
+    ocr.ocr(dummy_img)
+    print("[Model] ✅ Warm-up complete! Ready for user requests.")
+except Exception as e:
+    print(f"[Model] Warm-up note: {e}")
+
 
 # --------------------------------------------------
 # API Keys
@@ -72,7 +81,7 @@ Rules:
 
 
 # --------------------------------------------------
-# Lightweight HTTP LLM Invocation (Zero extra RAM)
+# Lightweight HTTP LLM Invocation (Zero extra RAM, 8s timeout)
 # --------------------------------------------------
 
 def query_llm_api(ocr_text):
@@ -101,19 +110,20 @@ def query_llm_api(ocr_text):
                 method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 content = data["choices"][0]["message"]["content"]
                 return json.loads(content)
         except Exception as e:
-            print(f"[LLM] Groq API call failed: {e}")
+            print(f"[LLM] Groq API call failed or timed out: {e}")
 
-    # 2. Try Hugging Face Serverless API if HF_TOKEN exists
+    # 2. Try Hugging Face Router API if HF_TOKEN exists
     if HF_TOKEN:
         try:
             print("[LLM] Querying Hugging Face API...")
-            url = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct/v1/chat/completions"
+            url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
             payload = json.dumps({
+                "model": "Qwen/Qwen2.5-7B-Instruct",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": f"OCR TEXT:\n{ocr_text}"}
@@ -132,15 +142,14 @@ def query_llm_api(ocr_text):
                 method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 content = data["choices"][0]["message"]["content"]
-                # Clean potential markdown
                 content = re.sub(r"^```json\s*", "", content.strip())
                 content = re.sub(r"\s*```$", "", content)
                 return json.loads(content)
         except Exception as e:
-            print(f"[LLM] HuggingFace API call failed: {e}")
+            print(f"[LLM] HuggingFace API call failed or timed out: {e}")
 
     return None
 
