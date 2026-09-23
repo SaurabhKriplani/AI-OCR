@@ -32,10 +32,7 @@ ocr = PaddleOCR(
     lang="en",
     ocr_version="PP-OCRv4",
     enable_mkldnn=False,
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-    show_log=False
+    use_angle_cls=False
 )
 
 print("[Model] PaddleOCR loaded successfully!")
