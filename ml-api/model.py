@@ -267,7 +267,7 @@ def extract_text(image_bytes):
 
     # 2. PaddleOCR
     print("\nRunning PaddleOCR...")
-    result = ocr.ocr(image_array, cls=False)
+    result = ocr.ocr(image_array)
 
     ocr_data = []
     if result and len(result) > 0 and result[0] is not None:
